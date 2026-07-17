@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { ChatMessage, FileProgress, Peer, ServerEvent } from './types'
+import type { ChatMessage, FileOffer, FileProgress, Peer, ServerEvent } from './types'
 
 const CHUNK_SIZE = 16 * 1024
+export const MAX_IMAGE_SIZE = 90 * 1024 * 1024
 const signalBase = import.meta.env.VITE_SIGNAL_URL || (
   import.meta.env.DEV ? 'http://localhost:8787' : 'https://api.msg.rem.asia'
 )
@@ -13,7 +14,7 @@ function sendSocketMessage(socket: WebSocket | null, message: unknown) {
 }
 
 interface IncomingFile {
-  meta: { id: string; name: string; size: number; senderName: string }
+  meta: { id: string; name: string; size: number; mimeType: string; senderName: string }
   chunks: ArrayBuffer[]
   received: number
 }
@@ -24,10 +25,13 @@ export function useRoom(roomId: string, name: string, onDisconnected: () => void
   const connections = useRef(new Map<string, RTCPeerConnection>())
   const channels = useRef(new Map<string, RTCDataChannel>())
   const incoming = useRef(new Map<string, IncomingFile>())
+  const publishedFiles = useRef(new Map<string, File>())
+  const offersRef = useRef<FileOffer[]>([])
   const filesRef = useRef<FileProgress[]>([])
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [peers, setPeers] = useState<Peer[]>([])
   const [files, setFiles] = useState<FileProgress[]>([])
+  const [fileOffers, setFileOffers] = useState<FileOffer[]>([])
   const [status, setStatus] = useState<'connecting' | 'online' | 'offline'>('connecting')
 
   const sendSignal = useCallback((target: string, data: RTCSessionDescriptionInit | RTCIceCandidateInit) => {
@@ -39,21 +43,24 @@ export function useRoom(roomId: string, name: string, onDisconnected: () => void
   }, [])
 
   useEffect(() => { filesRef.current = files }, [files])
+  useEffect(() => { offersRef.current = fileOffers }, [fileOffers])
 
   const handleChannelMessage = useCallback((peer: Peer, event: MessageEvent) => {
     if (typeof event.data === 'string') {
       const packet = JSON.parse(event.data)
       if (packet.type === 'file-meta') {
         incoming.current.set(packet.id, { meta: { ...packet, senderName: peer.name }, chunks: [], received: 0 })
+        setFileOffers((current) => current.map((offer) => offer.fileId === packet.offerId ? { ...offer, state: 'receiving' } : offer))
         setFiles((current) => [...current, {
           id: packet.id, name: packet.name, size: packet.size, progress: 0,
-          direction: 'receiving', peerName: peer.name,
+          direction: 'receiving', peerName: peer.name, mimeType: packet.mimeType || 'application/octet-stream',
         }])
       } else if (packet.type === 'file-end') {
         const transfer = incoming.current.get(packet.id)
         if (!transfer) return
-        const blob = new Blob(transfer.chunks)
+        const blob = new Blob(transfer.chunks, { type: transfer.meta.mimeType })
         updateFile(packet.id, { progress: 100, url: URL.createObjectURL(blob) })
+        setFileOffers((current) => current.map((offer) => offer.fileId === packet.offerId ? { ...offer, state: undefined } : offer))
         incoming.current.delete(packet.id)
       }
       return
@@ -117,6 +124,34 @@ export function useRoom(roomId: string, name: string, onDisconnected: () => void
     }
   }, [createConnection, sendSignal])
 
+  const transferFile = useCallback(async (file: File, peer: Peer, offerId?: string) => {
+    let channel = channels.current.get(peer.id)
+    const deadline = Date.now() + 10_000
+    while ((!channel || channel.readyState !== 'open') && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      channel = channels.current.get(peer.id)
+    }
+    if (!channel || channel.readyState !== 'open') throw new Error(`无法连接到 ${peer.name}`)
+
+    const id = crypto.randomUUID()
+    setFiles((current) => [...current, { id, name: file.name, size: file.size, progress: 0, direction: 'sending', peerName: peer.name, mimeType: file.type || 'application/octet-stream' }])
+    channel.send(JSON.stringify({ type: 'file-meta', id, offerId, name: file.name, size: file.size, mimeType: file.type || 'application/octet-stream' }))
+    let offset = 0
+    const idBytes = new TextEncoder().encode(id)
+    while (offset < file.size) {
+      while (channel.bufferedAmount > 512 * 1024) await new Promise((resolve) => setTimeout(resolve, 40))
+      const chunk = await file.slice(offset, offset + CHUNK_SIZE).arrayBuffer()
+      const packet = new Uint8Array(2 + idBytes.length + chunk.byteLength)
+      new DataView(packet.buffer).setUint16(0, idBytes.length)
+      packet.set(idBytes, 2)
+      packet.set(new Uint8Array(chunk), 2 + idBytes.length)
+      channel.send(packet)
+      offset += chunk.byteLength
+      updateFile(id, { progress: Math.round(offset / file.size * 100) })
+    }
+    channel.send(JSON.stringify({ type: 'file-end', id, offerId }))
+  }, [updateFile])
+
   useEffect(() => {
     const peerConnections = connections.current
     const transferredFiles = filesRef.current
@@ -139,13 +174,29 @@ export function useRoom(roomId: string, name: string, onDisconnected: () => void
             for (const peer of event.peers) await connectToPeer(peer)
           } else if (event.type === 'peer-joined') {
             setPeers((current) => current.some((peer) => peer.id === event.peer.id) ? current : [...current, event.peer])
+            for (const offer of offersRef.current) {
+              if (offer.sender.id === clientId.current && publishedFiles.current.has(offer.fileId)) {
+                sendSocketMessage(socket.current, { type: 'file-offer', target: event.peer.id, ...offer })
+              }
+            }
           } else if (event.type === 'peer-left') {
             setPeers((current) => current.filter((peer) => peer.id !== event.peerId))
             connections.current.get(event.peerId)?.close()
             connections.current.delete(event.peerId)
             channels.current.delete(event.peerId)
+            setFileOffers((current) => current.map((offer) => offer.sender.id === event.peerId ? { ...offer, available: false } : offer))
           } else if (event.type === 'chat') {
             setMessages((current) => [...current, event])
+          } else if (event.type === 'file-offer') {
+            setFileOffers((current) => {
+              const offer = { ...event, available: true } as FileOffer
+              const existing = current.findIndex((item) => item.fileId === event.fileId)
+              if (existing < 0) return [...current, offer]
+              return current.map((item, index) => index === existing ? { ...offer, state: item.state } : item)
+            })
+          } else if (event.type === 'file-request') {
+            const file = publishedFiles.current.get(event.fileId)
+            if (file) await transferFile(file, event.requester, event.fileId)
           } else if (event.type === 'signal') {
             await handleSignal(event)
           }
@@ -170,28 +221,27 @@ export function useRoom(roomId: string, name: string, onDisconnected: () => void
     sendSocketMessage(socket.current, { type: 'chat', id, text })
   }
 
-  const sendFile = async (file: File, peerId: string) => {
-    const channel = channels.current.get(peerId)
-    const peer = peers.find((item) => item.id === peerId)
-    if (!channel || channel.readyState !== 'open' || !peer) throw new Error('P2P 连接尚未就绪')
-    const id = crypto.randomUUID()
-    setFiles((current) => [...current, { id, name: file.name, size: file.size, progress: 0, direction: 'sending', peerName: peer.name }])
-    channel.send(JSON.stringify({ type: 'file-meta', id, name: file.name, size: file.size }))
-    let offset = 0
-    const idBytes = new TextEncoder().encode(id)
-    while (offset < file.size) {
-      while (channel.bufferedAmount > 512 * 1024) await new Promise((resolve) => setTimeout(resolve, 40))
-      const chunk = await file.slice(offset, offset + CHUNK_SIZE).arrayBuffer()
-      const packet = new Uint8Array(2 + idBytes.length + chunk.byteLength)
-      new DataView(packet.buffer).setUint16(0, idBytes.length)
-      packet.set(idBytes, 2)
-      packet.set(new Uint8Array(chunk), 2 + idBytes.length)
-      channel.send(packet)
-      offset += chunk.byteLength
-      updateFile(id, { progress: Math.round(offset / file.size * 100) })
+  const publishFile = (file: File, preview?: string) => {
+    if (file.type.startsWith('image/') && file.size > MAX_IMAGE_SIZE) {
+      throw new Error('图片大小不能超过 90 MB')
     }
-    channel.send(JSON.stringify({ type: 'file-end', id }))
+    const fileId = crypto.randomUUID()
+    publishedFiles.current.set(fileId, file)
+    sendSocketMessage(socket.current, {
+      type: 'file-offer', fileId, name: file.name, size: file.size,
+      mimeType: file.type || 'application/octet-stream',
+      preview,
+    })
   }
 
-  return { clientId: clientId.current, messages, peers, files, status, sendMessage, sendFile, leave: onDisconnected }
+  const requestFile = (offer: FileOffer) => {
+    if (!offer.available || offer.sender.id === clientId.current) return
+    setFileOffers((current) => current.map((item) => item.fileId === offer.fileId ? { ...item, state: 'requesting' } : item))
+    sendSocketMessage(socket.current, { type: 'file-request', fileId: offer.fileId, target: offer.sender.id })
+  }
+
+  return {
+    clientId: clientId.current, messages, peers, files, fileOffers, status,
+    sendMessage, publishFile, requestFile, leave: onDisconnected,
+  }
 }

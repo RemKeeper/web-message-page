@@ -130,23 +130,29 @@ export function useRoom(roomId: string, name: string, onDisconnected: () => void
     ws.onopen = () => setStatus('online')
     ws.onclose = () => setStatus('offline')
     ws.onerror = () => setStatus('offline')
-    ws.onmessage = async ({ data }) => {
-      const event = JSON.parse(data) as ServerEvent
-      if (event.type === 'welcome') {
-        setPeers(event.peers)
-        for (const peer of event.peers) await connectToPeer(peer)
-      } else if (event.type === 'peer-joined') {
-        setPeers((current) => current.some((peer) => peer.id === event.peer.id) ? current : [...current, event.peer])
-      } else if (event.type === 'peer-left') {
-        setPeers((current) => current.filter((peer) => peer.id !== event.peerId))
-        connections.current.get(event.peerId)?.close()
-        connections.current.delete(event.peerId)
-        channels.current.delete(event.peerId)
-      } else if (event.type === 'chat') {
-        setMessages((current) => [...current, event])
-      } else if (event.type === 'signal') {
-        await handleSignal(event)
-      }
+    ws.onmessage = ({ data }) => {
+      void (async () => {
+        try {
+          const event = JSON.parse(data) as ServerEvent
+          if (event.type === 'welcome') {
+            setPeers(event.peers)
+            for (const peer of event.peers) await connectToPeer(peer)
+          } else if (event.type === 'peer-joined') {
+            setPeers((current) => current.some((peer) => peer.id === event.peer.id) ? current : [...current, event.peer])
+          } else if (event.type === 'peer-left') {
+            setPeers((current) => current.filter((peer) => peer.id !== event.peerId))
+            connections.current.get(event.peerId)?.close()
+            connections.current.delete(event.peerId)
+            channels.current.delete(event.peerId)
+          } else if (event.type === 'chat') {
+            setMessages((current) => [...current, event])
+          } else if (event.type === 'signal') {
+            await handleSignal(event)
+          }
+        } catch (error) {
+          console.error('无法处理聊天室事件', error)
+        }
+      })()
     }
 
     return () => {

@@ -45,7 +45,9 @@ function ChatRoom({ session, onLeave }: { session: Session; onLeave: () => void 
   const bottomRef = useRef<HTMLDivElement>(null)
   const fileInput = useRef<HTMLInputElement>(null)
 
-  useEffect(() => bottomRef.current?.scrollIntoView({ behavior: 'smooth' }), [messages])
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages])
   useEffect(() => { if (!targetPeer && peers[0]) setTargetPeer(peers[0].id) }, [peers, targetPeer])
 
   const submit = (event: React.FormEvent) => {

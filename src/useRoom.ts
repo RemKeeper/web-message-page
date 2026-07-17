@@ -2,7 +2,15 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ChatMessage, FileProgress, Peer, ServerEvent } from './types'
 
 const CHUNK_SIZE = 16 * 1024
-const signalBase = import.meta.env.VITE_SIGNAL_URL || 'http://localhost:8787'
+const signalBase = import.meta.env.VITE_SIGNAL_URL || (
+  import.meta.env.DEV ? 'http://localhost:8787' : 'https://api.msg.rem.asia'
+)
+
+function sendSocketMessage(socket: WebSocket | null, message: unknown) {
+  if (socket?.readyState !== WebSocket.OPEN) return false
+  socket.send(JSON.stringify(message))
+  return true
+}
 
 interface IncomingFile {
   meta: { id: string; name: string; size: number; senderName: string }
@@ -23,7 +31,7 @@ export function useRoom(roomId: string, name: string, onDisconnected: () => void
   const [status, setStatus] = useState<'connecting' | 'online' | 'offline'>('connecting')
 
   const sendSignal = useCallback((target: string, data: RTCSessionDescriptionInit | RTCIceCandidateInit) => {
-    socket.current?.send(JSON.stringify({ type: 'signal', target, data }))
+    sendSocketMessage(socket.current, { type: 'signal', target, data })
   }, [])
 
   const updateFile = useCallback((id: string, patch: Partial<FileProgress>) => {
@@ -153,7 +161,7 @@ export function useRoom(roomId: string, name: string, onDisconnected: () => void
 
   const sendMessage = (text: string) => {
     const id = crypto.randomUUID()
-    socket.current?.send(JSON.stringify({ type: 'chat', id, text }))
+    sendSocketMessage(socket.current, { type: 'chat', id, text })
   }
 
   const sendFile = async (file: File, peerId: string) => {

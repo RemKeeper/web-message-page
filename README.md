@@ -16,4 +16,6 @@ npm install
 npm run dev
 ```
 
-开发环境默认连接 `http://localhost:8787`。部署时复制 `.env.example` 为 `.env.production`，并填写 Worker 地址。
+开发环境默认连接 `http://localhost:8787`，生产构建默认连接 `https://api.msg.rem.asia`。
+
+也可以在 Cloudflare 构建变量中通过 `VITE_SIGNAL_URL` 覆盖后端地址。该变量应填写 HTTPS 地址，前端会自动转换为 `wss://` WebSocket 地址。

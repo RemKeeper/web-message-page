@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import {
   ArrowDownToLine, ArrowRight, Check, Copy, Download, FileUp,
-  Hash, Image as ImageIcon, LogOut, MessageCircle, Paperclip, Send, Share2, ShieldCheck, Users, X,
+  Hash, Image as ImageIcon, LogOut, MessageCircle, Paperclip, RefreshCw, Send, Share2, ShieldCheck, Users, X,
 } from 'lucide-react'
 import { MAX_IMAGE_SIZE, useRoom } from './useRoom'
 import './App.css'
@@ -62,7 +62,7 @@ function JoinScreen({ onJoin }: { onJoin: (session: Session) => void }) {
 function ChatRoom({ session, onLeave }: { session: Session; onLeave: () => void }) {
   const {
     clientId, messages, peers, files, fileOffers, status,
-    sendMessage, publishFile, requestFile,
+    sendMessage, publishFile, requestFile, reconnect,
   } = useRoom(session.roomId, session.name, onLeave)
   const [draft, setDraft] = useState('')
   const [copied, setCopied] = useState(false)
@@ -109,7 +109,10 @@ function ChatRoom({ session, onLeave }: { session: Session; onLeave: () => void 
         <div className="sidebar-info"><ShieldCheck size={18} /><p><strong>阅后即焚式会话</strong><span>服务器不存储任何聊天内容</span></p></div>
       </aside>
       <section className="conversation">
-        <div className="conversation-top"><div><h2>房间对话</h2><p><span className={`status-dot ${status}`} />{status === 'online' ? '实时连接已建立' : status === 'connecting' ? '正在连接…' : '连接已断开'}</p></div></div>
+        <div className="conversation-top">
+          <div><h2>房间对话</h2><p><span className={`status-dot ${status}`} />{status === 'online' ? '实时连接已建立' : status === 'connecting' ? '正在连接…' : '连接已断开'}</p></div>
+          {status === 'offline' && <button className="reconnect-button" onClick={reconnect}><RefreshCw size={14} />重新连接</button>}
+        </div>
         <div className="message-list">
           <div className="system-message"><ShieldCheck size={15} />你已进入房间。这里的消息仅保存在当前页面。</div>
           {messages.length === 0 && <div className="empty-state"><MessageCircle size={34} /><strong>安静得刚刚好</strong><span>发一条消息，开启此刻的对话</span></div>}

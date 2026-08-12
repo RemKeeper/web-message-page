@@ -40,4 +40,5 @@ export type ServerEvent =
   | { type: 'chat'; id: string; text: string; sender: Peer; timestamp: number }
   | { type: 'file-offer'; fileId: string; name: string; size: number; mimeType: string; preview?: string; sender: Peer; timestamp: number }
   | { type: 'file-request'; fileId: string; requester: Peer }
+  | { type: 'file-error'; fileId: string; message: string; sender: Peer }
   | { type: 'signal'; from: string; fromName: string; data: RTCSessionDescriptionInit | RTCIceCandidateInit }

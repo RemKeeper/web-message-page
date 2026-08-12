@@ -24,6 +24,9 @@ export function useRoom(roomId: string, name: string, onDisconnected: () => void
   const socket = useRef<WebSocket | null>(null)
   const connections = useRef(new Map<string, RTCPeerConnection>())
   const channels = useRef(new Map<string, RTCDataChannel>())
+  const pendingCandidates = useRef(new Map<string, RTCIceCandidateInit[]>())
+  const signalQueues = useRef(new Map<string, Promise<void>>())
+  const connectingPeers = useRef(new Map<string, Promise<void>>())
   const incoming = useRef(new Map<string, IncomingFile>())
   const publishedFiles = useRef(new Map<string, File>())
   const offersRef = useRef<FileOffer[]>([])
@@ -33,6 +36,7 @@ export function useRoom(roomId: string, name: string, onDisconnected: () => void
   const [files, setFiles] = useState<FileProgress[]>([])
   const [fileOffers, setFileOffers] = useState<FileOffer[]>([])
   const [status, setStatus] = useState<'connecting' | 'online' | 'offline'>('connecting')
+  const [connectionAttempt, setConnectionAttempt] = useState(0)
 
   const sendSignal = useCallback((target: string, data: RTCSessionDescriptionInit | RTCIceCandidateInit) => {
     sendSocketMessage(socket.current, { type: 'signal', target, data })
@@ -80,53 +84,96 @@ export function useRoom(roomId: string, name: string, onDisconnected: () => void
   const configureChannel = useCallback((peer: Peer, channel: RTCDataChannel) => {
     channel.binaryType = 'arraybuffer'
     channel.onopen = () => channels.current.set(peer.id, channel)
-    channel.onclose = () => channels.current.delete(peer.id)
+    channel.onclose = () => {
+      if (channels.current.get(peer.id) === channel) channels.current.delete(peer.id)
+    }
     channel.onmessage = (event) => handleChannelMessage(peer, event)
   }, [handleChannelMessage])
 
+  const closeConnection = useCallback((peerId: string) => {
+    connections.current.get(peerId)?.close()
+    connections.current.delete(peerId)
+    channels.current.delete(peerId)
+    pendingCandidates.current.delete(peerId)
+  }, [])
+
   const createConnection = useCallback((peer: Peer) => {
     const existing = connections.current.get(peer.id)
-    if (existing) return existing
+    if (existing && existing.signalingState !== 'closed' && !['failed', 'closed'].includes(existing.connectionState)) {
+      return existing
+    }
+    if (existing) closeConnection(peer.id)
     const connection = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }] })
     connections.current.set(peer.id, connection)
     connection.onicecandidate = (event) => event.candidate && sendSignal(peer.id, event.candidate.toJSON())
     connection.ondatachannel = (event) => configureChannel(peer, event.channel)
     connection.onconnectionstatechange = () => {
       if (['failed', 'closed'].includes(connection.connectionState)) {
-        connections.current.delete(peer.id)
-        channels.current.delete(peer.id)
+        if (connections.current.get(peer.id) === connection) closeConnection(peer.id)
       }
     }
     return connection
-  }, [configureChannel, sendSignal])
+  }, [closeConnection, configureChannel, sendSignal])
 
   const connectToPeer = useCallback(async (peer: Peer) => {
-    const connection = createConnection(peer)
-    const channel = connection.createDataChannel('files', { ordered: true })
-    configureChannel(peer, channel)
-    const offer = await connection.createOffer()
-    await connection.setLocalDescription(offer)
-    sendSignal(peer.id, offer)
-  }, [configureChannel, createConnection, sendSignal])
+    const openChannel = channels.current.get(peer.id)
+    if (openChannel?.readyState === 'open') return
+    const pending = connectingPeers.current.get(peer.id)
+    if (pending) return pending
+
+    const connecting = (async () => {
+      let connection = connections.current.get(peer.id)
+      if (connection && (connection.signalingState !== 'stable' || ['failed', 'closed'].includes(connection.connectionState))) {
+        closeConnection(peer.id)
+        connection = undefined
+      }
+      connection ??= createConnection(peer)
+      const channel = connection.createDataChannel('files', { ordered: true })
+      configureChannel(peer, channel)
+      const offer = await connection.createOffer()
+      await connection.setLocalDescription(offer)
+      sendSignal(peer.id, offer)
+    })().finally(() => connectingPeers.current.delete(peer.id))
+
+    connectingPeers.current.set(peer.id, connecting)
+    return connecting
+  }, [closeConnection, configureChannel, createConnection, sendSignal])
 
   const handleSignal = useCallback(async (event: Extract<ServerEvent, { type: 'signal' }>) => {
     const peer = { id: event.from, name: event.fromName }
     const connection = createConnection(peer)
     if ('type' in event.data && (event.data.type === 'offer' || event.data.type === 'answer')) {
       await connection.setRemoteDescription(event.data as RTCSessionDescriptionInit)
+      const queuedCandidates = pendingCandidates.current.get(peer.id) || []
+      pendingCandidates.current.delete(peer.id)
+      for (const candidate of queuedCandidates) await connection.addIceCandidate(candidate)
       if (event.data.type === 'offer') {
         const answer = await connection.createAnswer()
         await connection.setLocalDescription(answer)
         sendSignal(peer.id, answer)
       }
+    } else if (!connection.remoteDescription) {
+      const queuedCandidates = pendingCandidates.current.get(peer.id) || []
+      queuedCandidates.push(event.data as RTCIceCandidateInit)
+      pendingCandidates.current.set(peer.id, queuedCandidates)
     } else {
       await connection.addIceCandidate(event.data as RTCIceCandidateInit)
     }
   }, [createConnection, sendSignal])
 
+  const queueSignal = useCallback((event: Extract<ServerEvent, { type: 'signal' }>) => {
+    const previous = signalQueues.current.get(event.from) || Promise.resolve()
+    const next = previous.catch(() => undefined).then(() => handleSignal(event))
+    signalQueues.current.set(event.from, next)
+    void next.finally(() => {
+      if (signalQueues.current.get(event.from) === next) signalQueues.current.delete(event.from)
+    })
+  }, [handleSignal])
+
   const transferFile = useCallback(async (file: File, peer: Peer, offerId?: string) => {
     let channel = channels.current.get(peer.id)
-    const deadline = Date.now() + 10_000
+    if (!channel || channel.readyState !== 'open') await connectToPeer(peer)
+    const deadline = Date.now() + 15_000
     while ((!channel || channel.readyState !== 'open') && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 100))
       channel = channels.current.get(peer.id)
@@ -150,11 +197,19 @@ export function useRoom(roomId: string, name: string, onDisconnected: () => void
       updateFile(id, { progress: Math.round(offset / file.size * 100) })
     }
     channel.send(JSON.stringify({ type: 'file-end', id, offerId }))
-  }, [updateFile])
+  }, [connectToPeer, updateFile])
+
+  const reconnect = useCallback(() => {
+    setStatus('connecting')
+    setConnectionAttempt((current) => current + 1)
+  }, [])
 
   useEffect(() => {
     const peerConnections = connections.current
-    const transferredFiles = filesRef.current
+    const dataChannels = channels.current
+    const queuedCandidates = pendingCandidates.current
+    const queuedSignals = signalQueues.current
+    const pendingPeerConnections = connectingPeers.current
     const url = new URL(`/rooms/${encodeURIComponent(roomId)}/connect`, signalBase)
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
     url.searchParams.set('clientId', clientId.current)
@@ -162,16 +217,29 @@ export function useRoom(roomId: string, name: string, onDisconnected: () => void
     const ws = new WebSocket(url)
     socket.current = ws
 
-    ws.onopen = () => setStatus('online')
-    ws.onclose = () => setStatus('offline')
-    ws.onerror = () => setStatus('offline')
+    ws.onopen = () => {
+      if (socket.current === ws) setStatus('online')
+    }
+    ws.onclose = () => {
+      if (socket.current === ws) setStatus('offline')
+    }
+    ws.onerror = () => {
+      if (socket.current === ws) setStatus('offline')
+    }
     ws.onmessage = ({ data }) => {
       void (async () => {
         try {
           const event = JSON.parse(data) as ServerEvent
           if (event.type === 'welcome') {
             setPeers(event.peers)
-            for (const peer of event.peers) await connectToPeer(peer)
+            for (const peer of event.peers) {
+              await connectToPeer(peer)
+              for (const offer of offersRef.current) {
+                if (offer.sender.id === clientId.current && publishedFiles.current.has(offer.fileId)) {
+                  sendSocketMessage(ws, { type: 'file-offer', target: peer.id, ...offer })
+                }
+              }
+            }
           } else if (event.type === 'peer-joined') {
             setPeers((current) => current.some((peer) => peer.id === event.peer.id) ? current : [...current, event.peer])
             for (const offer of offersRef.current) {
@@ -181,9 +249,7 @@ export function useRoom(roomId: string, name: string, onDisconnected: () => void
             }
           } else if (event.type === 'peer-left') {
             setPeers((current) => current.filter((peer) => peer.id !== event.peerId))
-            connections.current.get(event.peerId)?.close()
-            connections.current.delete(event.peerId)
-            channels.current.delete(event.peerId)
+            closeConnection(event.peerId)
             setFileOffers((current) => current.map((offer) => offer.sender.id === event.peerId ? { ...offer, available: false } : offer))
           } else if (event.type === 'chat') {
             setMessages((current) => [...current, event])
@@ -196,9 +262,24 @@ export function useRoom(roomId: string, name: string, onDisconnected: () => void
             })
           } else if (event.type === 'file-request') {
             const file = publishedFiles.current.get(event.fileId)
-            if (file) await transferFile(file, event.requester, event.fileId)
+            if (file) {
+              try {
+                await transferFile(file, event.requester, event.fileId)
+              } catch (error) {
+                sendSocketMessage(socket.current, {
+                  type: 'file-error',
+                  target: event.requester.id,
+                  fileId: event.fileId,
+                  message: error instanceof Error ? error.message : '文件传输失败',
+                })
+                throw error
+              }
+            }
+          } else if (event.type === 'file-error') {
+            setFileOffers((current) => current.map((offer) => offer.fileId === event.fileId ? { ...offer, state: undefined } : offer))
+            window.alert(event.message || `无法从 ${event.sender.name} 接收文件`)
           } else if (event.type === 'signal') {
-            await handleSignal(event)
+            queueSignal(event)
           }
         } catch (error) {
           console.error('无法处理聊天室事件', error)
@@ -207,14 +288,22 @@ export function useRoom(roomId: string, name: string, onDisconnected: () => void
     }
 
     return () => {
+      if (socket.current === ws) socket.current = null
       ws.close()
       peerConnections.forEach((connection) => connection.close())
       peerConnections.clear()
-      transferredFiles.forEach((file) => file.url && URL.revokeObjectURL(file.url))
+      dataChannels.clear()
+      queuedCandidates.clear()
+      queuedSignals.clear()
+      pendingPeerConnections.clear()
     }
-  // Room lifetime intentionally matches room/name values only.
+  // Connection lifetime intentionally also tracks explicit reconnect attempts.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roomId, name])
+  }, [roomId, name, connectionAttempt])
+
+  useEffect(() => () => {
+    filesRef.current.forEach((file) => file.url && URL.revokeObjectURL(file.url))
+  }, [])
 
   const sendMessage = (text: string) => {
     const id = crypto.randomUUID()
@@ -242,6 +331,6 @@ export function useRoom(roomId: string, name: string, onDisconnected: () => void
 
   return {
     clientId: clientId.current, messages, peers, files, fileOffers, status,
-    sendMessage, publishFile, requestFile, leave: onDisconnected,
+    sendMessage, publishFile, requestFile, reconnect, leave: onDisconnected,
   }
 }
